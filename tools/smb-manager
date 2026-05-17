@@ -7,12 +7,12 @@
 #              commands: create | unmount | status | verify | health | export | import | help
 # depends:     smbclient, mount.cifs, findmnt, grep, sed, awk, tr, flock
 # optional:    gum, fzf, systemd-escape, systemctl, mountpoint, notify-send, nc, timedatectl
-# curl:        curl -fsSL https://raw.githubusercontent.com/USER/raaviutils/main/tools/smb-manager | bash
+# curl:        curl -fsSL https://raw.githubusercontent.com/unrealthind/raaviutils/main/tools/smb-manager | bash
 # =============================================================================
 set -euo pipefail
 IFS=$'\n\t'
 
-_LIB="https://raw.githubusercontent.com/USER/raaviutils/main/lib"
+_LIB="https://raw.githubusercontent.com/unrealthind/raaviutils/main/lib"
 # shellcheck source=/dev/null
 source <(curl -fsSL "${_LIB}/colors.sh")
 # shellcheck source=/dev/null

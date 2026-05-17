@@ -6,11 +6,11 @@
 # usage:       string-generate [--hex [N]] [--pass [N]] [--token] [--help]
 # depends:     openssl
 # optional:    (none)
-# curl:        curl -fsSL https://raw.githubusercontent.com/USER/raaviutils/main/tools/string-generate | bash
+# curl:        curl -fsSL https://raw.githubusercontent.com/unrealthind/raaviutils/main/tools/string-generate | bash
 # =============================================================================
 set -euo pipefail
 
-_LIB="https://raw.githubusercontent.com/USER/raaviutils/main/lib"
+_LIB="https://raw.githubusercontent.com/unrealthind/raaviutils/main/lib"
 # shellcheck source=/dev/null
 source <(curl -fsSL "${_LIB}/colors.sh")
 # shellcheck source=/dev/null

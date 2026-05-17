@@ -7,11 +7,11 @@
 # usage:       run [--list]
 # depends:     curl, bash 4+
 # optional:    gum, fzf
-# curl:        curl -fsSL https://raw.githubusercontent.com/USER/raaviutils/main/run | bash
+# curl:        curl -fsSL https://raw.githubusercontent.com/unrealthind/raaviutils/main/run | bash
 # =============================================================================
 set -euo pipefail
 
-_BASE="https://raw.githubusercontent.com/USER/raaviutils/main"
+_BASE="https://raw.githubusercontent.com/unrealthind/raaviutils/main"
 _LIB="${_BASE}/lib"
 
 # shellcheck source=/dev/null
