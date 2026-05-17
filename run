@@ -406,8 +406,13 @@ if [[ $# -gt 0 ]]; then
   fi
 fi
 
-# Non-interactive or tiny terminal: fall back to plain menu
-if [[ ! -t 0 || ! -t 1 ]]; then
+# When piped through curl, stdin is the script — reopen from /dev/tty for interactivity
+if [[ ! -t 0 ]]; then
+  exec < /dev/tty 2>/dev/null || { _run_fallback; exit $?; }
+fi
+
+# Non-interactive stdout: fall back to plain menu
+if [[ ! -t 1 ]]; then
   _run_fallback
   exit $?
 fi
