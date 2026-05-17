@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tool:        run
+# category:    tools
+# description: Interactive TUI launcher for all raaviutils tools. Fetches and
+#              runs the selected tool on demand via curl.
+# usage:       run [--list]
+# depends:     curl, bash 4+
+# optional:    gum, fzf
+# curl:        curl -fsSL https://raw.githubusercontent.com/USER/raaviutils/main/run | bash
+# =============================================================================
+set -euo pipefail
+
+_BASE="https://raw.githubusercontent.com/USER/raaviutils/main"
+_LIB="${_BASE}/lib"
+
+# shellcheck source=/dev/null
+source <(curl -fsSL "${_LIB}/colors.sh")
+# shellcheck source=/dev/null
+source <(curl -fsSL "${_LIB}/detect.sh")
+# shellcheck source=/dev/null
+source <(curl -fsSL "${_LIB}/tui.sh")
+
+need curl "install curl"
+
+# Hardcoded tool manifest (updated each phase)
+declare -A TOOL_DESC
+TOOL_DESC["string-generate"]="Generate cryptographically random strings, passphrases, or tokens"
+TOOL_DESC["smb-manager"]="Interactively list, mount, unmount, and browse SMB/CIFS shares"
+
+TOOL_ORDER=(
+  "string-generate"
+  "smb-manager"
+)
+
+run::list() {
+  for tool in "${TOOL_ORDER[@]}"; do
+    printf "%-22s  %s\n" "$tool" "${TOOL_DESC[$tool]}"
+  done
+}
+
+run::launch() {
+  local tool="$1"
+  msg_info "Fetching and running: $tool"
+  bash <(curl -fsSL "${_BASE}/tools/${tool}") "${@:2}"
+}
+
+# --- argument parsing ---
+if [[ "${1:-}" == "--list" || "${1:-}" == "-l" ]]; then
+  run::list
+  exit 0
+fi
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  cat <<'USAGE'
+Usage: run [--list]
+
+  No args     Launch the interactive tool picker
+  --list      Print available tools and exit
+
+USAGE
+  exit 0
+fi
+
+# If a tool name was passed directly, run it
+if [[ $# -gt 0 ]]; then
+  tool="$1"
+  shift
+  if [[ -v "TOOL_DESC[$tool]" ]]; then
+    run::launch "$tool" "$@"
+    exit $?
+  else
+    msg_err "Unknown tool: $tool"
+    msg_info "Available tools:"
+    run::list >&2
+    exit 2
+  fi
+fi
+
+# --- interactive picker ---
+msg_info "raaviutils — pick a tool to run"
+printf '\n' >&2
+
+menu_items=()
+for tool in "${TOOL_ORDER[@]}"; do
+  menu_items+=("$(printf '%-22s  %s' "$tool" "${TOOL_DESC[$tool]}")")
+done
+
+picked=$(tui_pick "Select a tool (ESC to cancel)" "${menu_items[@]}")
+
+if [[ -z "$picked" ]]; then
+  msg_info "Canceled."
+  exit 0
+fi
+
+# Extract tool name from the picked line (first word)
+selected_tool="${picked%%  *}"
+selected_tool="${selected_tool%% *}"
+
+run::launch "$selected_tool"

@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tool:        string-generate
+# category:    tools
+# description: Generate cryptographically random strings, passphrases, or tokens.
+# usage:       string-generate [--hex [N]] [--pass [N]] [--token] [--help]
+# depends:     openssl
+# optional:    (none)
+# curl:        curl -fsSL https://raw.githubusercontent.com/USER/raaviutils/main/tools/string-generate | bash
+# =============================================================================
+set -euo pipefail
+
+_LIB="https://raw.githubusercontent.com/USER/raaviutils/main/lib"
+# shellcheck source=/dev/null
+source <(curl -fsSL "${_LIB}/colors.sh")
+# shellcheck source=/dev/null
+source <(curl -fsSL "${_LIB}/detect.sh")
+
+# --- dependency check ---
+need openssl "install openssl via your package manager (pacman -S openssl / apt install openssl / dnf install openssl)"
+
+# --- usage ---
+string_generate::usage() {
+  cat <<'USAGE'
+Usage: string-generate [mode] [options]
+
+Modes (mutually exclusive, default: --hex):
+  --hex [N]     N bytes of random hex (default N=32, output is 2*N chars)
+  --pass [N]    N-word random passphrase from system word list (default N=4)
+  --token       URL-safe base64 token (32 random bytes, 43 chars)
+
+Options:
+  --help        Show this help and exit
+
+Output is written to stdout. Safe to pipe or capture.
+
+Examples:
+  string-generate                   # 64-char hex string
+  string-generate --hex 16          # 32-char hex string
+  string-generate --pass 5          # 5-word passphrase
+  string-generate --token           # URL-safe base64 token
+USAGE
+}
+
+# --- generators ---
+string_generate::hex() {
+  local bytes="${1:-32}"
+  if ! [[ "$bytes" =~ ^[0-9]+$ ]] || ((bytes < 1)); then
+    msg_err "--hex requires a positive integer (got: ${bytes})"
+    exit 2
+  fi
+  openssl rand -hex "$bytes"
+}
+
+string_generate::passphrase() {
+  local count="${1:-4}"
+  if ! [[ "$count" =~ ^[0-9]+$ ]] || ((count < 1)); then
+    msg_err "--pass requires a positive integer (got: ${count})"
+    exit 2
+  fi
+
+  local wordlist=""
+  for candidate in /usr/share/dict/words /usr/share/dict/american-english \
+    /usr/share/dict/british-english /usr/share/dict/linux.words; do
+    if [[ -r "$candidate" ]]; then
+      wordlist="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$wordlist" ]]; then
+    msg_err "No system word list found. Install 'words' package (pacman -S words / apt install wamerican / dnf install words)."
+    exit 3
+  fi
+
+  local words=()
+  local line_count
+  line_count=$(wc -l <"$wordlist")
+
+  while ((${#words[@]} < count)); do
+    local rand_line
+    rand_line=$(openssl rand -hex 4)
+    rand_line=$((16#${rand_line} % line_count + 1))
+    local word
+    word=$(sed -n "${rand_line}p" "$wordlist")
+    # only accept plain lowercase alpha words (no apostrophes, hyphens, caps)
+    if [[ "$word" =~ ^[a-z]+$ ]] && ((${#word} >= 3)); then
+      words+=("$word")
+    fi
+  done
+
+  local IFS='-'
+  echo "${words[*]}"
+}
+
+string_generate::token() {
+  openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+}
+
+# --- argument parsing ---
+MODE="hex"
+MODE_ARG=""
+
+if [[ $# -eq 0 ]]; then
+  string_generate::hex
+  exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --hex)
+    MODE="hex"
+    if [[ $# -gt 1 && "$2" =~ ^[0-9]+$ ]]; then
+      MODE_ARG="$2"
+      shift
+    fi
+    ;;
+  --pass)
+    MODE="pass"
+    if [[ $# -gt 1 && "$2" =~ ^[0-9]+$ ]]; then
+      MODE_ARG="$2"
+      shift
+    fi
+    ;;
+  --token)
+    MODE="token"
+    ;;
+  --help | -h)
+    string_generate::usage
+    exit 0
+    ;;
+  *)
+    msg_err "Unknown argument: $1"
+    string_generate::usage >&2
+    exit 2
+    ;;
+  esac
+  shift
+done
+
+case "$MODE" in
+hex)   string_generate::hex   "${MODE_ARG:-32}" ;;
+pass)  string_generate::passphrase "${MODE_ARG:-4}" ;;
+token) string_generate::token ;;
+esac

@@ -1,0 +1,1470 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tool:        smb-manager
+# category:    tools
+# description: Interactively list, mount, unmount, and browse SMB/CIFS shares.
+# usage:       smb-manager [--yes] [--json] [--quiet] [--debug] <command> [args]
+#              commands: create | unmount | status | verify | health | export | import | help
+# depends:     smbclient, mount.cifs, findmnt, grep, sed, awk, tr, flock
+# optional:    gum, fzf, systemd-escape, systemctl, mountpoint, notify-send, nc, timedatectl
+# curl:        curl -fsSL https://raw.githubusercontent.com/USER/raaviutils/main/tools/smb-manager | bash
+# =============================================================================
+set -euo pipefail
+IFS=$'\n\t'
+
+_LIB="https://raw.githubusercontent.com/USER/raaviutils/main/lib"
+# shellcheck source=/dev/null
+source <(curl -fsSL "${_LIB}/colors.sh")
+# shellcheck source=/dev/null
+source <(curl -fsSL "${_LIB}/detect.sh")
+# shellcheck source=/dev/null
+source <(curl -fsSL "${_LIB}/tui.sh")
+
+# --- hard deps ---
+need findmnt  "install util-linux"
+need grep     "install grep"
+need sed      "install sed"
+need awk      "install gawk"
+need tr       "install coreutils"
+need flock    "install util-linux"
+need smbclient "install samba-client (pacman -S smbclient / apt install smbclient / dnf install samba-client)"
+need mount.cifs "install cifs-utils (pacman -S cifs-utils / apt install cifs-utils / dnf install cifs-utils)"
+
+# --- optional capability flags (env vars can force-disable) ---
+_HAS_NOTIFY=0
+_HAS_TIMEOUT=0
+[[ -z "${NO_NOTIFY:-}" ]] && have notify-send && _HAS_NOTIFY=1
+[[ -z "${NO_TIMEOUT:-}" ]] && have timeout    && _HAS_TIMEOUT=1
+
+# --- global flags ---
+FLAG_YES=0
+FLAG_JSON=0
+FLAG_QUIET=0
+FLAG_DEBUG=0
+
+# --- helpers ---
+smb_manager::trim()          { sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//' <<<"$1"; }
+smb_manager::sanitize_name() {
+  local s
+  s="$(tr -c 'A-Za-z0-9._-' '_' <<<"$1")"
+  s="$(sed -e 's/_\{2,\}/_/g' -e 's/^_//' -e 's/_$//' <<<"$s")"
+  printf '%s' "$s"
+}
+smb_manager::fstab_escape() { sed -e 's/\\/\\\\/g' -e 's/ /\\040/g' -e $'s/\t/\\011/g' <<<"$1"; }
+smb_manager::json_escape()  { sed 's/\\/\\\\/g; s/"/\\"/g' <<<"${1-}"; }
+smb_manager::smb_run()      { (smbclient "$@" 2> >(grep -v "Can't load /etc/samba/smb.conf" >&2)); }
+
+smb_manager::jout()   { if ((FLAG_JSON));  then printf '%s\n' "$1"; fi; }
+smb_manager::hlog()   { ((FLAG_QUIET)) || msg_info "$@"; }
+smb_manager::dlog()   { ((FLAG_DEBUG))  && msg_warn "[debug] $*"; }
+smb_manager::notify() { ((_HAS_NOTIFY)) && notify-send "SMB Manager" "$*" || true; }
+
+# --- spinner for slow smbclient calls ---
+smb_manager::spin() {
+  local pid=$1 msg="${2:-Working...}"
+  local s='|/-\'
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r  ${C_BLU}%s${C_NC} %s" "${s:$((i++ % 4)):1}" "$msg" >&2
+    sleep 0.12
+  done
+  printf "\r\033[2K" >&2
+}
+
+# flock guard — write operations only
+smb_manager::acquire_write_lock() {
+  local lf="/tmp/smb_manager_${USER}.lock"
+  exec 9>"$lf"
+  flock -n 9 || {
+    msg_err "Another smb-manager write operation is already running."
+    exit 1
+  }
+}
+
+# --- credential file helpers ---
+# Globals populated by creds_parse_file (no concurrent subshell callers)
+CREDS_USER=""
+CREDS_PASS=""
+CREDS_DOMAIN=""
+smb_manager::creds_parse_file() {
+  local file="$1"
+  CREDS_USER=""
+  CREDS_PASS=""
+  CREDS_DOMAIN=""
+  [[ -f "$file" ]] || return 1
+  while IFS='=' read -r k v; do
+    case "$k" in
+    username) CREDS_USER="$v" ;;
+    password) CREDS_PASS="$v" ;;
+    domain)   CREDS_DOMAIN="$v" ;;
+    esac
+  done < <(grep -E '^(username|password|domain)=' "$file" || true)
+  [[ -n "$CREDS_USER" && -n "$CREDS_PASS" ]] || return 1
+  return 0
+}
+
+smb_manager::write_credfile() {
+  local path="$1" scope="$2" user="$3" pass="$4" domain="$5"
+  if [[ "$scope" == "user" ]]; then
+    {
+      echo "username=$user"
+      echo "password=$pass"
+      [[ -n "$domain" ]] && echo "domain=$domain"
+    } >"$path"
+    chmod 600 "$path"
+    local _ru="${SUDO_USER:-}"
+    [[ -n "$_ru" ]] && chown "$_ru" "$path" || true
+  else
+    local tf
+    tf="$(mktemp)"
+    {
+      echo "username=$user"
+      echo "password=$pass"
+      [[ -n "$domain" ]] && echo "domain=$domain"
+    } >"$tf"
+    chmod 600 "$tf"
+    sudo mv "$tf" "$path"
+    sudo chown root:root "$path"
+  fi
+  msg_ok "Credentials saved: $path"
+}
+
+# --- fstab helpers ---
+smb_manager::list_cifs_mounts() {
+  mapfile -t lines < <(findmnt -rno TARGET,SOURCE,FSTYPE,OPTIONS | awk '$3=="cifs"{print}')
+  if ((${#lines[@]} == 0)); then
+    msg_info "No CIFS mounts detected."
+    return 1
+  fi
+  msg_info "Current CIFS mounts:"
+  local i=1
+  for L in "${lines[@]}"; do
+    local target source
+    target=$(awk '{print $1}' <<<"$L")
+    source=$(awk '{print $2}' <<<"$L")
+    printf "  %2d) TARGET: %s\n      SOURCE: %s\n" "$i" "$target" "$source" >&2
+    ((i++))
+  done
+  return 0
+}
+
+smb_manager::find_fstab_line_for_target() {
+  local target="$1"
+  awk -v tgt="$target" \
+    '($0 !~ /^[[:space:]]*#/)&&$2==tgt&&$3=="cifs"{print; exit}' /etc/fstab || true
+}
+
+smb_manager::fstab_has_entry() {
+  local source="$1" target="$2"
+  awk -v src="$source" -v tgt="$target" \
+    '($0 !~ /^[[:space:]]*#/)&&$1==src&&$2==tgt&&$3=="cifs"{found=1} END{exit found?0:1}' \
+    /etc/fstab
+}
+
+# ===== ENVIRONMENT CHECK =====
+smb_manager::detect_env() {
+  ENV_NAME="Linux"
+  ENV_FATAL=""
+  ENV_WARN=""
+  HAS_SYSTEMD=0
+  HAS_MOUNT_CIFS_BIN=0
+  HAS_CAP_SYSADMIN=0
+
+  have mount.cifs && HAS_MOUNT_CIFS_BIN=1
+
+  [[ "$(ps -p 1 -o comm= 2>/dev/null)" == "systemd" ]] && HAS_SYSTEMD=1
+
+  local _capeff
+  _capeff=$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null || echo 0)
+  local _cap_dec=$((16#${_capeff:-0}))
+  (((_cap_dec >> 21) & 1)) && HAS_CAP_SYSADMIN=1 || true
+
+  if grep -qi microsoft /proc/version 2>/dev/null; then
+    if uname -r 2>/dev/null | grep -qi 'WSL2\|microsoft-standard'; then
+      IS_WSL2=1
+      ENV_NAME="WSL 2"
+      ENV_WARN="fstab mounts take effect at WSL restart, not immediately."
+    else
+      IS_WSL1=1
+      ENV_NAME="WSL 1"
+      ENV_FATAL="WSL 1 has no CIFS kernel support. Upgrade to WSL 2 or use native Windows SMB access."
+    fi
+    return
+  fi
+
+  IS_WSL1=0
+  IS_WSL2=0
+
+  if [[ -f /.dockerenv ]] || grep -q 'docker\|containerd' /proc/self/cgroup 2>/dev/null; then
+    IS_DOCKER=1
+    ENV_NAME="Docker"
+    ((HAS_CAP_SYSADMIN)) ||
+      ENV_FATAL="Docker container lacks CAP_SYS_ADMIN. Run with --cap-add SYS_ADMIN or mount on the host."
+    return
+  fi
+  IS_DOCKER=0
+
+  local _virt=""
+  if have systemd-detect-virt; then
+    _virt=$(systemd-detect-virt --container 2>/dev/null || true)
+  fi
+  if [[ "$_virt" == "lxc" ]] ||
+     grep -q 'lxc' /proc/self/cgroup 2>/dev/null ||
+     [[ -f /run/host/container-manager ]]; then
+    IS_LXC=1
+    if ((HAS_CAP_SYSADMIN)); then
+      ENV_NAME="LXC (privileged)"
+      ((HAS_SYSTEMD)) ||
+        ENV_WARN="systemd not running — x-systemd.automount options will be omitted from fstab."
+    else
+      IS_LXC_UNPRIV=1
+      ENV_NAME="LXC (unprivileged)"
+      ENV_FATAL="Unprivileged LXC lacks CAP_SYS_ADMIN. mount.cifs cannot work.\nFix: add 'lxc.cap.keep: sys_admin' to the container config, or mount on the host and bind-mount in."
+    fi
+    return
+  fi
+  IS_LXC=0
+  IS_LXC_UNPRIV=0
+}
+
+smb_manager::show_env_check() {
+  local W=44
+  local BAR
+  BAR="$(printf '─%.0s' $(seq 1 $W))"
+
+  _row() {
+    local dot="$1" label="$2" value="$3"
+    local pad=$((W - 7 - ${#label} - ${#value}))
+    ((pad < 1)) && pad=1
+    local spaces
+    spaces=$(printf '%*s' "$pad" '')
+    printf "  ${C_BLU}│${C_NC}  ${dot}  %s%s%s  ${C_BLU}│${C_NC}\n" \
+      "$label" "$spaces" "$value" >&2
+  }
+  _divider() { printf "  ${C_BLU}├${BAR}┤${C_NC}\n" >&2; }
+  _blank()   { printf "  ${C_BLU}│${C_NC}%*s${C_BLU}│${C_NC}\n" "$W" "" >&2; }
+
+  printf "\n" >&2
+  printf "  ${C_BLU}┌${BAR}┐${C_NC}\n" >&2
+
+  local title="  smb-manager - environment check"
+  local tpad=$((W - ${#title} - 2))
+  ((tpad < 1)) && tpad=1
+  printf "  ${C_BLU}│${C_NC}%s%*s  ${C_BLU}│${C_NC}\n" "$title" "$tpad" "" >&2
+  _divider
+
+  local plat_pad=$((W - 20 - ${#ENV_NAME}))
+  ((plat_pad < 1)) && plat_pad=1
+  printf "  ${C_BLU}│${C_NC}    Platform      %s%*s  ${C_BLU}│${C_NC}\n" \
+    "$ENV_NAME" "$plat_pad" "" >&2
+  _blank
+
+  if ((HAS_MOUNT_CIFS_BIN)); then
+    _row "${C_GRN}●${C_NC}" "mount.cifs   " "available"
+  else
+    _row "${C_RED}●${C_NC}" "mount.cifs   " "missing  "
+  fi
+
+  if ((HAS_CAP_SYSADMIN)); then
+    _row "${C_GRN}●${C_NC}" "CAP_SYS_ADMIN" "granted  "
+  else
+    _row "${C_RED}●${C_NC}" "CAP_SYS_ADMIN" "denied   "
+  fi
+
+  if ((HAS_SYSTEMD)); then
+    _row "${C_GRN}●${C_NC}" "systemd      " "running  "
+  else
+    _row "${C_YLW}●${C_NC}" "systemd      " "not running"
+  fi
+
+  if ((IS_WSL2)); then
+    _row "${C_YLW}●${C_NC}" "fstab mounts " "restart needed"
+  fi
+
+  _blank
+  _divider
+
+  local verdict_text verdict_dot
+  if [[ -z "$ENV_FATAL" ]]; then
+    verdict_dot="${C_GRN}● READY  ${C_NC}"
+    verdict_text="this system is supported"
+  else
+    verdict_dot="${C_RED}● BLOCKED${C_NC}"
+    verdict_text="will not work here      "
+  fi
+  local vpad=$((W - 15 - ${#verdict_text}))
+  ((vpad < 1)) && vpad=1
+  printf "  ${C_BLU}│${C_NC}  %b  %s%*s  ${C_BLU}│${C_NC}\n" \
+    "$verdict_dot" "$verdict_text" "$vpad" "" >&2
+
+  printf "  ${C_BLU}└${BAR}┘${C_NC}\n\n" >&2
+}
+
+smb_manager::check_environment() {
+  smb_manager::detect_env
+  smb_manager::show_env_check
+
+  if [[ -n "$ENV_WARN" ]]; then
+    msg_warn "$ENV_WARN"
+    printf '\n' >&2
+  fi
+
+  if [[ -n "$ENV_FATAL" ]]; then
+    msg_err "$ENV_FATAL"
+    exit 1
+  fi
+}
+
+# ===== USAGE =====
+smb_manager::usage() {
+  cat <<'USAGE'
+smb-manager [global flags] <command> [args]
+
+Commands:
+  create        Create a persistent mount (per-share creds, fstab safe edits)
+  unmount       Unmount & clean (fstab, dir, creds prompt)
+  status        Show current CIFS mounts (table or JSON)
+  verify        Run preflight: DNS/port 445, smbclient probe, time skew
+  health        Check all mounts: state, space, rw sanity test
+  export        [not yet implemented]
+  import        [not yet implemented]
+  help          Show this help
+
+Global flags:
+  --yes         Assume "yes" to confirmations
+  --json        Machine-readable output
+  --quiet       Minimal human output
+  --debug       Verbose diagnostics
+  --no-fzf      Disable fzf even if available
+  --no-notify   Disable desktop notifications
+  --no-timeout  Disable timeout command use
+
+Examples:
+  smb-manager status
+  smb-manager --yes create
+  smb-manager verify --host 192.168.1.10
+USAGE
+}
+
+# ===== ARGUMENT PARSING =====
+CMD=""
+GLOBAL_ARGS=()
+
+for arg in "$@"; do
+  case "$arg" in
+  create|unmount|status|verify|health|export|import|help) CMD="$arg" ;;
+  --yes)      FLAG_YES=1 ;;
+  --json)     FLAG_JSON=1 ;;
+  --quiet)    FLAG_QUIET=1 ;;
+  --debug)    FLAG_DEBUG=1 ;;
+  --no-fzf)   _HAS_FZF=0 ;;
+  --no-notify) _HAS_NOTIFY=0 ;;
+  --no-timeout) _HAS_TIMEOUT=0 ;;
+  -h|--help)  CMD="help" ;;
+  *)          GLOBAL_ARGS+=("$arg") ;;
+  esac
+done
+
+# ===== UNMOUNT / CLEAN =====
+smb_manager::unmount() {
+  mapfile -t lines < <(findmnt -rno TARGET,SOURCE,FSTYPE,OPTIONS | awk '$3=="cifs"{print}')
+  if ((${#lines[@]} == 0)); then
+    msg_warn "No CIFS mounts to unmount."
+    return
+  fi
+
+  local TARGETS=() SOURCES=()
+  local i=1
+  for L in "${lines[@]}"; do
+    local target source
+    target=$(awk '{print $1}' <<<"$L")
+    source=$(awk '{print $2}' <<<"$L")
+    TARGETS+=("$target")
+    SOURCES+=("$source")
+    ((i++))
+  done
+
+  local MOUNT_POINT="" SOURCE="" idx=0
+
+  if ((_HAS_FZF)); then
+    local fzf_lines=()
+    for i in "${!TARGETS[@]}"; do
+      fzf_lines+=("$(printf '%s  →  %s' "${TARGETS[$i]}" "${SOURCES[$i]}")")
+    done
+    local picked
+    picked=$(printf '%s\n' "${fzf_lines[@]}" |
+      fzf --prompt="Unmount > " --height=40% --reverse --no-multi \
+        --header="Select a CIFS mount (ESC to cancel)" 2>/dev/null || true)
+    [[ -z "$picked" ]] && { msg_info "Canceled."; return; }
+    for i in "${!fzf_lines[@]}"; do
+      [[ "${fzf_lines[$i]}" == "$picked" ]] && idx=$i && break
+    done
+  else
+    i=1
+    for t in "${TARGETS[@]}"; do
+      printf "  %2d) TARGET: %s\n      SOURCE: %s\n" "$i" "$t" "${SOURCES[$((i - 1))]}" >&2
+      ((i++))
+    done
+    local choice
+    while :; do
+      choice=$(tui_prompt "Choose [1-${#TARGETS[@]}] (or 0 to cancel)")
+      [[ "$choice" =~ ^[0-9]+$ ]] || { msg_warn "Enter a number."; continue; }
+      if ((choice == 0)); then
+        msg_info "Canceled."
+        return
+      elif ((choice >= 1 && choice <= ${#TARGETS[@]})); then
+        break
+      else
+        msg_warn "Out of range."
+      fi
+    done
+    idx=$((choice - 1))
+  fi
+
+  MOUNT_POINT="${TARGETS[$idx]}"
+  SOURCE="${SOURCES[$idx]}"
+  msg_ok "Selected:\n   TARGET: $MOUNT_POINT\n   SOURCE: $SOURCE"
+
+  if have systemd-escape && have systemctl; then
+    local ub
+    ub=$(systemd-escape -p "$MOUNT_POINT")
+    msg_info "Stopping potential systemd units: ${ub}.automount / ${ub}.mount"
+    sudo systemctl stop "${ub}.automount" >/dev/null 2>&1 || true
+    sudo systemctl stop "${ub}.mount" >/dev/null 2>&1 || true
+    msg_ok "Systemd units stopped (if present)."
+  fi
+
+  local mounted=0
+  if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+    mounted=1
+  elif findmnt -no TARGET --target "$MOUNT_POINT" >/dev/null 2>&1; then
+    mounted=1
+  fi
+
+  if ((mounted)); then
+    msg_info "Unmounting: $MOUNT_POINT"
+    local _uerr=""
+    if _uerr=$(sudo umount "$MOUNT_POINT" 2>&1); then
+      msg_ok "Unmounted."
+    else
+      if grep -qi 'not mounted' <<<"$_uerr"; then
+        msg_info "Already unmounted. Continuing."
+      else
+        msg_warn "Unmount failed: $_uerr"
+        local ans
+        ans=$(tui_prompt "Try lazy unmount (-l)? [y/N]")
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          msg_info "Lazy unmount: umount -l $MOUNT_POINT"
+          local _luerr=""
+          if _luerr=$(sudo umount -l "$MOUNT_POINT" 2>&1); then
+            msg_ok "Lazy unmounted."
+          else
+            if grep -qi 'not mounted' <<<"$_luerr"; then
+              msg_info "Already unmounted. Continuing."
+            else
+              msg_err "Lazy unmount failed: $_luerr"
+              return
+            fi
+          fi
+        else
+          msg_err "Leaving mount in place."
+          return
+        fi
+      fi
+    fi
+  else
+    msg_info "Mount point not currently mounted (automount idle). Continuing."
+  fi
+
+  local FSTAB_LINE
+  FSTAB_LINE="$(smb_manager::find_fstab_line_for_target "$MOUNT_POINT")"
+  if [[ -n "$FSTAB_LINE" ]]; then
+    printf '\n' >&2
+    msg_info "Matching /etc/fstab entry:"
+    printf "    %s\n" "$FSTAB_LINE" >&2
+    local rm_ans
+    rm_ans=$(tui_prompt "Remove this line from /etc/fstab? [y/N]")
+    if [[ "$rm_ans" =~ ^[Yy]$ ]]; then
+      local BAK="/etc/fstab.bak.$(date +%s)"
+      msg_info "Backup /etc/fstab → $BAK"
+      sudo cp /etc/fstab "$BAK"
+      msg_ok "Backup created."
+      local mp="$MOUNT_POINT"
+      msg_info "Removing fstab line for: $mp"
+      sudo awk -v tgt="$mp" \
+        '($0 ~ /^[[:space:]]*#/){print; next} !($2==tgt && $3=="cifs")' \
+        /etc/fstab | sudo tee /etc/fstab.tmp >/dev/null
+      sudo mv /etc/fstab.tmp /etc/fstab
+      msg_ok "Removed from /etc/fstab."
+      have systemctl && {
+        msg_info "Reloading systemd"
+        sudo systemctl daemon-reload || true
+        msg_ok "Reloaded."
+      }
+    else
+      msg_info "Kept /etc/fstab unchanged."
+    fi
+  else
+    msg_info "No matching /etc/fstab entry for: $MOUNT_POINT"
+  fi
+
+  local deldir
+  deldir=$(tui_prompt "Delete mount directory ($MOUNT_POINT)? [y/N]")
+  if [[ "$deldir" =~ ^[Yy]$ ]]; then
+    msg_info "Deleting directory: $MOUNT_POINT"
+    local _rmerr=""
+    if _rmerr=$(rmdir "$MOUNT_POINT" 2>&1); then
+      msg_ok "Directory removed."
+    else
+      msg_warn "rmdir failed: $_rmerr"
+      local rmr
+      rmr=$(tui_prompt "Recursive delete with sudo rm -rf? [y/N]")
+      if [[ "$rmr" =~ ^[Yy]$ ]]; then
+        msg_info "sudo rm -rf $MOUNT_POINT"
+        sudo rm -rf "$MOUNT_POINT"
+        msg_ok "Force-removed."
+      else
+        msg_info "Directory left intact."
+      fi
+    fi
+  else
+    msg_info "Directory kept."
+  fi
+
+  local CRED_PATH=""
+  if [[ -n "${FSTAB_LINE:-}" ]]; then
+    CRED_PATH=$(awk -F',' \
+      '{for(i=1;i<=NF;i++){ if($i ~ /credentials=/){ sub(/.*credentials=/,"",$i); print $i }}}' \
+      <<<"$FSTAB_LINE")
+  fi
+  if [[ -n "$CRED_PATH" && -f "$CRED_PATH" ]]; then
+    printf '\n' >&2
+    msg_info "Credentials file appears to be: $CRED_PATH"
+    local delc
+    delc=$(tui_prompt "Delete credentials file? [y/N]")
+    if [[ "$delc" =~ ^[Yy]$ ]]; then
+      msg_info "Deleting credentials: $CRED_PATH"
+      rm -f "$CRED_PATH" 2>/dev/null || {
+        msg_warn "Trying sudo..."
+        sudo rm -f "$CRED_PATH"
+      }
+      msg_ok "Credentials file deleted."
+    else
+      msg_info "Credentials kept."
+    fi
+  else
+    msg_info "No obvious credentials file to remove."
+  fi
+
+  msg_ok "Unmount/cleanup complete."
+}
+
+# ===== CREATE MOUNT =====
+smb_manager::create() {
+  local HOST=""
+  while [[ -z "$HOST" ]]; do HOST=$(tui_prompt "Enter SMB host (IP or hostname)"); done
+  msg_info "Target host: $HOST"
+
+  msg_info "Trying anonymous share listing on //$HOST ..."
+  local LIST_OUT="" PROTO_DETECT=""
+  local TMPU="" TMPP=""
+
+  local _lo_tmp
+  _lo_tmp=$(mktemp)
+  smb_manager::smb_run -gL "//$HOST" -N >"$_lo_tmp" 2>/dev/null &
+  local _pid=$!
+  smb_manager::spin "$_pid" "Listing shares on //$HOST (anonymous)..."
+  if wait "$_pid"; then
+    LIST_OUT=$(cat "$_lo_tmp")
+    rm -f "$_lo_tmp"
+    PROTO_DETECT="auto"
+    msg_ok "Anonymous listing succeeded."
+  else
+    rm -f "$_lo_tmp"
+    msg_warn "Anonymous listing blocked (likely good)."
+
+    local used_existing_for_listing=0
+    local _scan_home="$HOME"
+    [[ -n "${SUDO_USER:-}" ]] &&
+      _scan_home=$(getent passwd "$SUDO_USER" | cut -d: -f6 2>/dev/null || echo "$HOME")
+
+    local _existing_creds=()
+    local _f
+    for _f in "$_scan_home/.smbcredentials-${HOST}-"* \
+              "/root/.smbcredentials-${HOST}-"*; do
+      [[ -f "$_f" ]] || continue
+      local _dup=0
+      local _e
+      for _e in "${_existing_creds[@]:-}"; do
+        [[ "$_e" == "$_f" ]] && _dup=1 && break
+      done
+      ((_dup)) || _existing_creds+=("$_f")
+    done
+
+    if ((${#_existing_creds[@]})); then
+      msg_info "Existing credentials found for $HOST:"
+      local _chosen_cred=""
+
+      if ((_HAS_FZF)); then
+        local _fzf_cred_lines=()
+        for _f in "${_existing_creds[@]}"; do
+          local _u
+          _u=$(awk -F= '/^username/{print $2; exit}' "$_f" 2>/dev/null || echo "?")
+          _fzf_cred_lines+=("$(printf 'user: %-20s  %s' "$_u" "$_f")")
+        done
+        local _picked_line
+        _picked_line=$(printf '%s\n' "${_fzf_cred_lines[@]}" "[enter temporary credentials]" |
+          fzf --prompt="Credentials > " --height=40% --reverse --no-multi \
+            --header="Select existing credentials for listing (ESC = skip)" 2>/dev/null || true)
+        if [[ -n "$_picked_line" && "$_picked_line" != "[enter temporary credentials]" ]]; then
+          _chosen_cred="${_picked_line##*  }"
+        fi
+      else
+        local _ci=1
+        for _f in "${_existing_creds[@]}"; do
+          local _u
+          _u=$(awk -F= '/^username/{print $2; exit}' "$_f" 2>/dev/null || echo "?")
+          printf "  %2d) user: %-20s  %s\n" "$_ci" "$_u" "$_f" >&2
+          ((_ci++))
+        done
+        printf "   0) Enter temporary credentials instead\n" >&2
+        local _cpick
+        while :; do
+          _cpick=$(tui_prompt "Choose [1-${#_existing_creds[@]}] or 0 for new")
+          [[ "$_cpick" =~ ^[0-9]+$ ]] || { msg_warn "Enter a number."; continue; }
+          if ((_cpick == 0)); then
+            break
+          elif ((_cpick >= 1 && _cpick <= ${#_existing_creds[@]})); then
+            _chosen_cred="${_existing_creds[$((_cpick - 1))]}"
+            break
+          else
+            msg_warn "Out of range."
+          fi
+        done
+      fi
+
+      if [[ -n "$_chosen_cred" ]] && smb_manager::creds_parse_file "$_chosen_cred"; then
+        local _lo_tmp2
+        _lo_tmp2=$(mktemp)
+        { smb_manager::smb_run -gL "//$HOST" -m SMB3 -U "${CREDS_USER}%${CREDS_PASS}" \
+            >"$_lo_tmp2" 2>/dev/null ||
+          smb_manager::smb_run -gL "//$HOST" -m SMB2 -U "${CREDS_USER}%${CREDS_PASS}" \
+            >"$_lo_tmp2" 2>/dev/null; } &
+        local _pid2=$!
+        smb_manager::spin "$_pid2" "Listing shares (existing creds)..."
+        if wait "$_pid2"; then
+          LIST_OUT=$(cat "$_lo_tmp2")
+          rm -f "$_lo_tmp2"
+          PROTO_DETECT="SMB3"
+          msg_ok "Share listing with existing creds succeeded."
+          TMPU="$CREDS_USER"
+          TMPP="$CREDS_PASS"
+          used_existing_for_listing=1
+        else
+          rm -f "$_lo_tmp2"
+          msg_warn "Listing failed with selected credentials. Falling through to temporary creds."
+        fi
+      fi
+    fi
+
+    if ((!used_existing_for_listing)); then
+      TMPU=$(tui_prompt "Temporary username for listing (leave blank to skip)")
+      if [[ -n "$TMPU" ]]; then
+        TMPP=$(tui_password "Temporary password for $TMPU")
+        local _lo_tmp3
+        _lo_tmp3=$(mktemp)
+        smb_manager::smb_run -gL "//$HOST" -m SMB3 -U "${TMPU}%${TMPP}" >"$_lo_tmp3" 2>/dev/null &
+        local _pid3=$!
+        smb_manager::spin "$_pid3" "Listing shares via SMB3..."
+        if wait "$_pid3"; then
+          LIST_OUT=$(cat "$_lo_tmp3")
+          rm -f "$_lo_tmp3"
+          PROTO_DETECT="SMB3"
+          msg_ok "Share listing via SMB3 succeeded."
+        else
+          rm -f "$_lo_tmp3"
+          local _lo_tmp4
+          _lo_tmp4=$(mktemp)
+          smb_manager::smb_run -gL "//$HOST" -m SMB2 -U "${TMPU}%${TMPP}" >"$_lo_tmp4" 2>/dev/null &
+          local _pid4=$!
+          smb_manager::spin "$_pid4" "Listing shares via SMB2..."
+          if wait "$_pid4"; then
+            LIST_OUT=$(cat "$_lo_tmp4")
+            rm -f "$_lo_tmp4"
+            PROTO_DETECT="SMB2"
+            msg_ok "Share listing via SMB2 succeeded."
+          else
+            rm -f "$_lo_tmp4"
+            msg_err "Could not list shares (even with creds). You can still type a share manually."
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  local SHARES=()
+  if [[ -n "${LIST_OUT:-}" ]]; then
+    while IFS='|' read -r typ name _rest; do
+      [[ "$typ" == "Disk" ]] || continue
+      name="$(smb_manager::trim "$name")"
+      [[ "$name" == "IPC$" || "$name" == "ADMIN$" || "$name" == "print$" ]] && continue
+      SHARES+=("$name")
+    done <<<"$LIST_OUT"
+  fi
+
+  local SHARE=""
+  if ((${#SHARES[@]})); then
+    msg_info "Shares found on //$HOST:"
+    if ((_HAS_FZF)); then
+      local fzf_opts=("${SHARES[@]}" "[enter manually]")
+      local picked
+      picked=$(printf '%s\n' "${fzf_opts[@]}" |
+        fzf --prompt="Share > " --height=40% --reverse --no-multi \
+          --header="Select a share on //$HOST" 2>/dev/null || true)
+      [[ -z "$picked" ]] && { msg_info "Canceled."; return; }
+      if [[ "$picked" == "[enter manually]" ]]; then
+        SHARE=$(tui_prompt "Type the share name (case-sensitive)")
+        SHARE="$(smb_manager::trim "$SHARE")"
+      else
+        SHARE="$(smb_manager::trim "$picked")"
+      fi
+    else
+      local i
+      for i in "${!SHARES[@]}"; do printf "  %2d) %s\n" $((i + 1)) "${SHARES[$i]}" >&2; done
+      printf "   0) Enter share name manually\n" >&2
+      local pick
+      while :; do
+        pick=$(tui_prompt "Choose a share number (or 0 to type manually)")
+        if [[ "$pick" =~ ^[0-9]+$ ]] && ((pick >= 0 && pick <= ${#SHARES[@]})); then
+          if ((pick == 0)); then
+            SHARE=$(tui_prompt "Type the share name (case-sensitive)")
+            SHARE="$(smb_manager::trim "$SHARE")"
+          else
+            SHARE="${SHARES[$((pick - 1))]}"
+            SHARE="$(smb_manager::trim "$SHARE")"
+          fi
+          break
+        else
+          msg_warn "Invalid choice."
+        fi
+      done
+    fi
+  else
+    SHARE=$(tui_prompt "No shares listed. Type share name to mount (case-sensitive)")
+    SHARE="$(smb_manager::trim "$SHARE")"
+  fi
+  [[ -z "$SHARE" ]] && { msg_err "No share selected."; return; }
+  msg_ok "Selected share: //${HOST}/${SHARE}"
+
+  local scope=""
+  while :; do
+    local s
+    s=$(tui_prompt "Mount for (u)ser-only or (s)ystem-wide? [u/s]")
+    case "$s" in
+    u|U) scope="user";   break ;;
+    s|S) scope="system"; break ;;
+    *)   msg_warn "Enter 'u' or 's'." ;;
+    esac
+  done
+  msg_ok "Scope: $scope"
+
+  local REAL_USER="${SUDO_USER:-$USER}"
+  local REAL_GROUP
+  REAL_GROUP=$(id -gn "$REAL_USER")
+  local REAL_HOME
+  REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6 2>/dev/null || echo "$HOME")
+
+  local DEFAULT_BASE
+  [[ "$scope" == "user" ]] && DEFAULT_BASE="$REAL_HOME/mnt" || DEFAULT_BASE="/mnt"
+  msg_info "Default mount path: $DEFAULT_BASE/$HOST/$SHARE"
+
+  local MOUNT_DIR=""
+  while :; do
+    local dc
+    dc=$(tui_prompt "Use default path or custom? ([d]efault / [c]ustom)")
+    case "$dc" in
+    d|D)
+      MOUNT_DIR="$DEFAULT_BASE/$HOST/$SHARE"
+      break
+      ;;
+    c|C)
+      MOUNT_DIR=$(tui_prompt "Enter full mount path (absolute)")
+      [[ "$MOUNT_DIR" = /* ]] || { msg_warn "Provide an absolute path."; continue; }
+      break
+      ;;
+    *) msg_warn "Enter d or c." ;;
+    esac
+  done
+
+  msg_info "Create directory: $MOUNT_DIR"
+  if [[ "$scope" == "user" ]]; then
+    mkdir -p "$MOUNT_DIR"
+    chown "$REAL_USER":"$REAL_GROUP" "$MOUNT_DIR"
+  else
+    sudo mkdir -p "$MOUNT_DIR"
+    sudo chown root:root "$MOUNT_DIR"
+  fi
+  msg_ok "Directory ready: $MOUNT_DIR"
+
+  local SHARE_SAFE
+  SHARE_SAFE="$(smb_manager::sanitize_name "$(smb_manager::trim "$SHARE")")"
+  local CREDFILE HOST_CRED
+
+  if [[ "$scope" == "user" ]]; then
+    CREDFILE="$REAL_HOME/.smbcredentials-${HOST}-${SHARE_SAFE}"
+    HOST_CRED="$REAL_HOME/.smbcredentials-$HOST"
+  else
+    CREDFILE="/root/.smbcredentials-${HOST}-${SHARE_SAFE}"
+    HOST_CRED="/root/.smbcredentials-$HOST"
+  fi
+
+  if [[ -f "$CREDFILE" ]]; then
+    msg_info "Per-share credentials already exist: $CREDFILE"
+  else
+    local _cred_written=0
+
+    if [[ -n "$TMPU" ]]; then
+      msg_info "Credentials used for listing — user: $TMPU"
+      local _reuse_tmp
+      _reuse_tmp=$(tui_prompt "Save these as the permanent credentials for this share? [Y/n]")
+      if [[ ! "$_reuse_tmp" =~ ^[Nn]$ ]]; then
+        local SMB_DOMAIN=""
+        SMB_DOMAIN=$(tui_prompt "SMB domain for $TMPU (leave blank if none)")
+        msg_info "Write credentials file: $CREDFILE"
+        smb_manager::write_credfile "$CREDFILE" "$scope" "$TMPU" "$TMPP" "$SMB_DOMAIN"
+        _cred_written=1
+      fi
+    fi
+
+    if ((!_cred_written)); then
+      if [[ -f "$HOST_CRED" ]]; then
+        local use_copy
+        use_copy=$(tui_prompt "Use existing host creds from $HOST_CRED for this share? [y/N]")
+        if [[ "$use_copy" =~ ^[Yy]$ ]]; then
+          msg_info "Copying $HOST_CRED → $CREDFILE"
+          if [[ "$scope" == "user" ]]; then
+            cp "$HOST_CRED" "$CREDFILE"
+            chmod 600 "$CREDFILE"
+          else
+            sudo cp "$HOST_CRED" "$CREDFILE"
+            sudo chmod 600 "$CREDFILE"
+            sudo chown root:root "$CREDFILE"
+          fi
+          msg_ok "Per-share credentials ready: $CREDFILE"
+          _cred_written=1
+        fi
+      fi
+    fi
+
+    if ((!_cred_written)); then
+      msg_info "Enter credentials to save securely (per-share)."
+      local SMB_USER SMB_PASS SMB_DOMAIN
+      SMB_USER=$(tui_prompt "SMB username")
+      SMB_PASS=$(tui_password "SMB password")
+      SMB_DOMAIN=$(tui_prompt "SMB domain (leave blank if none)")
+      msg_info "Write credentials file: $CREDFILE"
+      smb_manager::write_credfile "$CREDFILE" "$scope" "$SMB_USER" "$SMB_PASS" "$SMB_DOMAIN"
+    fi
+  fi
+
+  local SMB_USER="" SMB_PASS="" SMB_DOMAIN=""
+  if smb_manager::creds_parse_file "$CREDFILE"; then
+    SMB_USER="$CREDS_USER"
+    SMB_PASS="$CREDS_PASS"
+    SMB_DOMAIN="$CREDS_DOMAIN"
+  fi
+
+  local SMB_VERS=""
+  if [[ "$PROTO_DETECT" == "SMB3" || "$PROTO_DETECT" == "auto" ]]; then
+    SMB_VERS="3.1.1"
+  elif [[ "$PROTO_DETECT" == "SMB2" ]]; then
+    SMB_VERS="2.1"
+  else
+    msg_info "Verifying SMB version via quick probe on //$HOST/$SHARE ..."
+    if [[ -n "$SMB_USER" && -n "$SMB_PASS" ]] &&
+       smb_manager::smb_run -m SMB3 -U "${SMB_USER}%${SMB_PASS}" \
+         "//$HOST/$SHARE" -c quit >/dev/null 2>&1; then
+      SMB_VERS="3.1.1"
+    elif [[ -n "$SMB_USER" && -n "$SMB_PASS" ]] &&
+         smb_manager::smb_run -m SMB2 -U "${SMB_USER}%${SMB_PASS}" \
+           "//$HOST/$SHARE" -c quit >/dev/null 2>&1; then
+      SMB_VERS="2.1"
+    elif [[ -n "$SMB_USER" && -n "$SMB_PASS" ]] &&
+         smb_manager::smb_run -U "${SMB_USER}%${SMB_PASS}" \
+           "//$HOST/$SHARE" -c quit >/dev/null 2>&1; then
+      msg_warn "Explicit SMB3/SMB2 probe failed — letting server negotiate version."
+      SMB_VERS="3.0"
+    else
+      msg_err "Cannot connect to //$HOST/$SHARE. Check host, share name, and credentials."
+      return
+    fi
+  fi
+  msg_ok "Using SMB vers=${SMB_VERS}"
+
+  local IDLE_OPT=""
+  if ((HAS_SYSTEMD)); then
+    local en
+    en=$(tui_prompt "Enable auto-unmount when idle? [y/N]")
+    if [[ "$en" =~ ^[Yy]$ ]]; then
+      local t
+      t=$(tui_prompt "Idle timeout seconds" "300")
+      if [[ "$t" =~ ^[0-9]+$ ]] && ((t > 0)); then
+        IDLE_OPT=",x-systemd.idle-timeout=${t}"
+        msg_ok "Idle unmount: ${t}s"
+      else
+        msg_warn "Invalid timeout; skipping."
+      fi
+    else
+      msg_info "Idle unmount disabled."
+    fi
+  else
+    msg_info "systemd not running — skipping idle-timeout option."
+  fi
+
+  local SRC="//${HOST}/${SHARE}" SRC_ESC TGT_ESC
+  SRC_ESC="$(smb_manager::fstab_escape "$SRC")"
+  TGT_ESC="$(smb_manager::fstab_escape "$MOUNT_DIR")"
+
+  local UID_VAL GID_VAL
+  UID_VAL=$(id -u "$REAL_USER")
+  GID_VAL=$(id -g "$REAL_USER")
+
+  local AUTOMOUNT_OPT=""
+  ((HAS_SYSTEMD)) && AUTOMOUNT_OPT=",x-systemd.automount"
+
+  local OPTS="_netdev${AUTOMOUNT_OPT}${IDLE_OPT},nofail,credentials=${CREDFILE},vers=${SMB_VERS},uid=${UID_VAL},gid=${GID_VAL},file_mode=0644,dir_mode=0755"
+  local LINE="${SRC_ESC} ${TGT_ESC} cifs ${OPTS} 0 0"
+
+  local BAK="/etc/fstab.bak.$(date +%s)"
+  msg_info "Backup /etc/fstab → $BAK"
+  sudo cp /etc/fstab "$BAK"
+  msg_ok "Backup created."
+
+  if smb_manager::fstab_has_entry "$SRC_ESC" "$TGT_ESC"; then
+    msg_warn "Matching fstab entry already exists; skipping append."
+  else
+    msg_info "Append to /etc/fstab:"
+    printf "      %s\n" "$LINE" >&2
+    printf '%s\n' "$LINE" | sudo tee -a /etc/fstab >/dev/null
+    msg_ok "fstab updated."
+  fi
+
+  msg_info "Mount: $MOUNT_DIR"
+  local _merr=""
+  if _merr=$(sudo mount "$MOUNT_DIR" 2>&1); then
+    msg_ok "Mounted: $MOUNT_DIR"
+    mount | grep --color=never " ${MOUNT_DIR} " || true
+  else
+    msg_warn "Mount failed: $_merr"
+    msg_warn "Try: sudo mount -a"
+    return
+  fi
+
+  if ((IS_WSL2)); then
+    msg_info "Note: on WSL 2, fstab mounts are not re-applied automatically. Run 'sudo mount -a' or restart WSL to re-mount after reboot."
+  fi
+
+  msg_info "Create-mount flow complete."
+}
+
+# ===== VERIFY =====
+VER_JSON_ITEMS=()
+smb_manager::add_result() {
+  local status="$1"
+  shift
+  local msg="$*"
+  local tag
+  case "$status" in
+  OK)   tag="${C_GRN}OK${C_NC}" ;;
+  WARN) tag="${C_YLW}WARN${C_NC}" ;;
+  ERR)  tag="${C_RED}ERR${C_NC}" ;;
+  *)    tag="$status" ;;
+  esac
+  ((FLAG_JSON)) || printf "  - [%b] %s\n" "$tag" "$msg" >&2
+  VER_JSON_ITEMS+=("$(printf '{"status":"%s","message":"%s"}' \
+    "$(printf '%s' "$status" | sed 's/"/\\"/g')" \
+    "$(printf '%s' "$msg"    | sed 's/"/\\"/g')")")
+}
+
+smb_manager::check_dns() {
+  local host="$1" ip
+  if ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}'); then
+    smb_manager::add_result OK "DNS/hosts resolved $host → $ip"
+  else
+    smb_manager::add_result WARN "Could not resolve $host (still may work if using IP)"
+    return 1
+  fi
+}
+
+smb_manager::check_port_445() {
+  local host="$1" timeout_s="${2:-3}"
+  if have nc; then
+    if nc -z -w "$timeout_s" "$host" 445 >/dev/null 2>&1; then
+      smb_manager::add_result OK "TCP/445 reachable on $host"
+    else
+      smb_manager::add_result ERR "TCP/445 not reachable on $host (firewall/VPN/route?)"
+      return 1
+    fi
+  elif ((_HAS_TIMEOUT)); then
+    if timeout "$timeout_s" bash -c ">/dev/tcp/$host/445" 2>/dev/null; then
+      smb_manager::add_result OK "TCP/445 reachable on $host"
+    else
+      smb_manager::add_result ERR "TCP/445 not reachable on $host (no nc; used /dev/tcp)"
+      return 1
+    fi
+  else
+    smb_manager::add_result WARN "Cannot test TCP/445 (need nc or timeout)."
+  fi
+}
+
+smb_manager::check_smb_probe() {
+  local host="$1" credfile="${2:-}"
+  if smb_manager::smb_run -gL "//$host" -N >/dev/null 2>&1; then
+    smb_manager::add_result OK "smbclient anonymous listing succeeded on //$host."
+    return 0
+  fi
+  if [[ -n "$credfile" ]] && smb_manager::creds_parse_file "$credfile"; then
+    if smb_manager::smb_run -gL "//$host" -m SMB3 -U "${CREDS_USER}%${CREDS_PASS}" >/dev/null 2>&1 ||
+       smb_manager::smb_run -gL "//$host" -m SMB2 -U "${CREDS_USER}%${CREDS_PASS}" >/dev/null 2>&1; then
+      smb_manager::add_result OK "smbclient auth listing succeeded on //$host with $credfile"
+      return 0
+    else
+      smb_manager::add_result ERR "smbclient auth listing failed on //$host using $credfile"
+      return 1
+    fi
+  fi
+  smb_manager::add_result WARN "smbclient probe failed anonymously and no/invalid credfile supplied."
+  return 1
+}
+
+smb_manager::check_time_sync() {
+  if have timedatectl; then
+    local sync
+    sync=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "")
+    if [[ "$sync" == "yes" ]]; then
+      smb_manager::add_result OK "Time is NTP-synchronized (timedatectl). SMB auth is time-sensitive."
+    else
+      smb_manager::add_result WARN "Time not reported as NTP-synchronized. Kerberos/NTLM may fail if clock skew >5 min."
+    fi
+  else
+    smb_manager::add_result WARN "timedatectl not available; cannot confirm time sync."
+  fi
+}
+
+smb_manager::check_cifs_kernel() {
+  if lsmod | grep -q '^cifs'; then
+    local v
+    v=$(modinfo cifs 2>/dev/null | awk -F': ' '/^version:/{print $2; exit}')
+    smb_manager::add_result OK "cifs kernel module loaded${v:+ (v $v)}"
+  else
+    if modprobe cifs 2>/dev/null; then
+      smb_manager::add_result WARN "cifs module was not loaded; loaded now."
+    else
+      smb_manager::add_result WARN "cifs module not loaded and modprobe failed (may be loaded on host — continuing)."
+    fi
+  fi
+}
+
+smb_manager::check_fstab_syntax() {
+  if findmnt -s >/dev/null 2>&1; then
+    smb_manager::add_result OK "/etc/fstab parses cleanly (findmnt -s)."
+  else
+    smb_manager::add_result ERR "findmnt -s reported parse errors for /etc/fstab."
+  fi
+}
+
+smb_manager::guess_credfile_for_host() {
+  local host="$1"
+  awk -v h="//$host/" '
+    $0 !~ /^[[:space:]]*#/ && $3=="cifs" && index($1,h)==1 {
+      n=split($0,a,",")
+      for(i=1;i<=n;i++){
+        if(a[i] ~ /credentials=/){ sub(/.*credentials=/,"",a[i]); print a[i]; exit }
+      }
+    }' /etc/fstab | head -n1
+}
+
+smb_manager::hosts_from_fstab() {
+  awk '$0 !~ /^[[:space:]]*#/ && $3=="cifs"{print $1}' /etc/fstab |
+    sed -n 's#^//\([^/]\+\)/.*#\1#p' | sort -u
+}
+
+smb_manager::verify() {
+  local host="" credfile=""
+  local i=1
+  while ((i <= $#)); do
+    case "${!i}" in
+    --host)
+      ((i++))
+      host="${!i}"
+      ;;
+    --cred|--credentials)
+      ((i++))
+      credfile="${!i}"
+      ;;
+    *) ;;
+    esac
+    ((i++))
+  done
+
+  if [[ -z "$host" ]]; then
+    mapfile -t fhosts < <(smb_manager::hosts_from_fstab)
+    if ((${#fhosts[@]})); then
+      if ((_HAS_FZF)); then
+        host="$(printf "%s\n" "${fhosts[@]}" |
+          fzf --prompt="Verify host > " --height=10 --reverse 2>/dev/null || true)"
+      fi
+      if [[ -z "$host" ]]; then
+        ((FLAG_JSON)) || {
+          printf "Select a host from fstab (number) or type a hostname/IP:\n" >&2
+          local idx=1
+          for h in "${fhosts[@]}"; do
+            printf "  %2d) %s\n" "$idx" "$h" >&2
+            ((idx++))
+          done
+          local pick
+          pick=$(tui_prompt "Choice (number or host/IP)")
+          if [[ "$pick" =~ ^[0-9]+$ ]] && ((pick >= 1 && pick <= ${#fhosts[@]})); then
+            host="${fhosts[$((pick - 1))]}"
+          else
+            host="$pick"
+          fi
+        }
+      fi
+    else
+      host=$(tui_prompt "Host/IP to verify")
+    fi
+  fi
+
+  host="$(smb_manager::trim "$host")"
+  if [[ -z "$host" ]]; then
+    smb_manager::add_result ERR "No host provided for verify."
+    smb_manager::jout '{"verify":[]}'
+    return 2
+  fi
+
+  [[ -z "$credfile" ]] && credfile="$(smb_manager::guess_credfile_for_host "$host")"
+  if [[ -n "$credfile" && ! -f "$credfile" ]]; then
+    smb_manager::add_result WARN "Credfile referenced but not found: $credfile"
+    credfile=""
+  fi
+
+  ((FLAG_JSON)) || msg_info "Verifying SMB host: $host${credfile:+  (cred: $credfile)}"
+  VER_JSON_ITEMS=()
+
+  smb_manager::check_dns "$host"
+  smb_manager::check_port_445 "$host" 3
+  smb_manager::check_smb_probe "$host" "$credfile"
+  smb_manager::check_time_sync
+  smb_manager::check_cifs_kernel
+  smb_manager::check_fstab_syntax
+
+  if ((FLAG_JSON)); then
+    local sep="" out='{"verify":['
+    for item in "${VER_JSON_ITEMS[@]}"; do
+      out+="${sep}${item}"
+      sep=","
+    done
+    out+=']}'
+    printf '%s\n' "$out"
+  fi
+}
+
+# ===== HEALTH =====
+smb_manager::get_opt() {
+  local opts="$1" key="$2"
+  awk -F',' -v k="$key" \
+    '{ for(i=1;i<=NF;i++) if($i~("^"k"=")){ sub("^"k"=","",$i); print $i; exit } }' \
+    <<<"$opts"
+}
+
+smb_manager::unit_state_for_target() {
+  local target="$1"
+  if have systemd-escape && have systemctl; then
+    local ub
+    ub=$(systemd-escape -p "$target")
+    local st
+    st=$(systemctl is-active "${ub}.mount" 2>/dev/null || echo "unknown")
+    if [[ "$st" != "active" ]]; then
+      local ast
+      ast=$(systemctl is-active "${ub}.automount" 2>/dev/null || echo "")
+      [[ -n "$ast" && "$ast" != "unknown" ]] && st="automount:$ast"
+    fi
+    printf '%s %s' "$st" "$ub"
+  else
+    printf 'unknown '
+  fi
+}
+
+smb_manager::space_for_target() {
+  local target="$1"
+  df -hP "$target" 2>/dev/null | awk 'NR==2{printf "used %s / size %s (%s)", $3, $2, $5}'
+}
+
+smb_manager::rw_sanity_test() {
+  local target="$1"
+  local tf="$target/.smb_manager_health.$$.$RANDOM"
+  if (: >"$tf") 2>/dev/null; then
+    if printf 'ping\n' >>"$tf" 2>/dev/null; then
+      rm -f "$tf" 2>/dev/null
+      printf 'OK write/delete succeeded'
+      return 0
+    else
+      rm -f "$tf" 2>/dev/null
+      printf 'ERR created but failed to write'
+      return 1
+    fi
+  else
+    printf 'WARN no write permission (read-only or ACL).'
+    return 2
+  fi
+}
+
+HEALTH_JSON_ITEMS=()
+smb_manager::emit_mount_health() {
+  local target="$1" source="$2" opts="$3" state="$4" unit="$5" \
+        space_line="$6" rw_result="$7" rw_msg="$8"
+  local vers idle
+  vers="$(smb_manager::get_opt "$opts" "vers")"
+  idle="$(smb_manager::get_opt "$opts" "x-systemd.idle-timeout")"
+
+  if ((!FLAG_JSON)); then
+    printf "\nTARGET: %s\nSOURCE: %s\n" "$target" "$source" >&2
+    printf "  - state: %s%s\n" "$state" "${unit:+ (unit: $unit)}" >&2
+    printf "  - vers: %s\n" "${vers:-unknown}" >&2
+    printf "  - idle-timeout: %s\n" "${idle:-none}" >&2
+    [[ -n "$space_line" ]] && printf "  - space: %s\n" "$space_line" >&2
+    if [[ -n "$rw_result" ]]; then
+      if [[ "$rw_result" == OK* ]]; then
+        printf "  - rw test: ${C_GRN}%s${C_NC} %s\n" "$rw_result" "$rw_msg" >&2
+      else
+        printf "  - rw test: ${C_RED}%s${C_NC} %s\n" "$rw_result" "$rw_msg" >&2
+      fi
+    fi
+  fi
+
+  local json_item
+  json_item="$(printf \
+    '{"target":"%s","source":"%s","state":"%s","unit":"%s","vers":"%s","idle_timeout":"%s","space":"%s","rw":{"status":"%s","message":"%s"}}' \
+    "$(smb_manager::json_escape "$target")" "$(smb_manager::json_escape "$source")" \
+    "$(smb_manager::json_escape "$state")"  "$(smb_manager::json_escape "$unit")" \
+    "$(smb_manager::json_escape "${vers:-}")" "$(smb_manager::json_escape "${idle:-}")" \
+    "$(smb_manager::json_escape "$space_line")" \
+    "$(smb_manager::json_escape "${rw_result:-}")" "$(smb_manager::json_escape "${rw_msg:-}")")"
+  HEALTH_JSON_ITEMS+=("$json_item")
+}
+
+smb_manager::health() {
+  local DO_RW=1
+  for arg in "$@"; do [[ "$arg" == "--no-rw" ]] && DO_RW=0; done
+
+  mapfile -t lines < <(findmnt -rno TARGET,SOURCE,FSTYPE,OPTIONS | awk '$3=="cifs"{print}')
+  if ((${#lines[@]} == 0)); then
+    smb_manager::hlog "No CIFS mounts detected."
+    smb_manager::jout '{"health":[]}'
+    return 0
+  fi
+
+  HEALTH_JSON_ITEMS=()
+  ((FLAG_JSON)) || msg_info "Checking health of ${#lines[@]} CIFS mount(s)... (rw test: $( ((DO_RW)) && echo on || echo off))"
+
+  for L in "${lines[@]}"; do
+    local target source opts
+    target=$(awk '{print $1}' <<<"$L")
+    source=$(awk '{print $2}' <<<"$L")
+    opts=$(awk '{$1=$2=$3=""; sub(/^   */,""); print}' <<<"$L")
+
+    local mstate="mounted"
+    mountpoint -q "$target" 2>/dev/null || mstate="not-mounted"
+
+    local unit_state unit_base
+    read -r unit_state unit_base < <(smb_manager::unit_state_for_target "$target")
+    local space_line
+    space_line="$(smb_manager::space_for_target "$target")"
+
+    local rw_status="" rw_msg=""
+    if ((DO_RW)); then
+      local rw_combined
+      rw_combined="$(smb_manager::rw_sanity_test "$target" || true)"
+      rw_status="${rw_combined%% *}"
+      rw_msg="${rw_combined#* }"
+    fi
+
+    smb_manager::emit_mount_health "$target" "$source" "$opts" \
+      "$mstate/${unit_state}" "${unit_base:-}" "$space_line" "$rw_status" "$rw_msg"
+  done
+
+  if ((FLAG_JSON)); then
+    local sep="" out='{"health":['
+    for item in "${HEALTH_JSON_ITEMS[@]}"; do
+      out+="${sep}${item}"
+      sep=","
+    done
+    out+=']}'
+    printf '%s\n' "$out"
+  fi
+}
+
+# ===== STATUS =====
+smb_manager::last_error_for_unit() {
+  local unit="$1" hours="${2:-24}"
+  if have journalctl && [[ -n "$unit" ]]; then
+    journalctl -u "${unit}.mount" --since "${hours} hours ago" \
+      -p err..alert --no-pager 2>/dev/null |
+      tail -n1 | sed 's/^[^:]*: //'
+  fi
+}
+
+smb_manager::status() {
+  local SHOW_ALL=0 SHOW_ERRORS=0
+  for arg in "$@"; do
+    case "$arg" in
+    --all)    SHOW_ALL=1 ;;
+    --errors) SHOW_ERRORS=1 ;;
+    esac
+  done
+
+  local awk_filter='$3=="cifs"{print}'
+  ((SHOW_ALL)) && awk_filter='{print}'
+
+  mapfile -t lines < <(findmnt -rno TARGET,SOURCE,FSTYPE,OPTIONS | awk "$awk_filter")
+  if ((${#lines[@]} == 0)); then
+    smb_manager::hlog "No matching mounts detected."
+    smb_manager::jout '{"mounts":[]}'
+    return 0
+  fi
+
+  if ((!FLAG_JSON)); then
+    if ((SHOW_ERRORS)); then
+      printf "%-36s %-18s %-18s %-7s %-7s %-4s %-18s %-30s\n" \
+        "TARGET" "STATE" "UNIT" "VERS" "IDLE" "MODE" "SPACE" "LAST_ERROR(24h)" >&2
+    else
+      printf "%-36s %-18s %-18s %-7s %-7s %-4s %-18s\n" \
+        "TARGET" "STATE" "UNIT" "VERS" "IDLE" "MODE" "SPACE" >&2
+    fi
+  fi
+
+  local sep="" out='{"mounts":['
+  for L in "${lines[@]}"; do
+    local target source fstype opts
+    target=$(awk '{print $1}' <<<"$L")
+    source=$(awk '{print $2}' <<<"$L")
+    fstype=$(awk '{print $3}' <<<"$L")
+    opts=$(awk '{$1=$2=$3=""; sub(/^   */,""); print}' <<<"$L")
+
+    local mstate="mounted"
+    mountpoint -q "$target" 2>/dev/null || mstate="not-mounted"
+
+    local unit_state unit_base
+    read -r unit_state unit_base < <(smb_manager::unit_state_for_target "$target")
+
+    local vers idle mode space_line last_err=""
+    vers="$(smb_manager::get_opt "$opts" "vers")"
+    idle="$(smb_manager::get_opt "$opts" "x-systemd.idle-timeout")"
+    [[ ",$opts," == *",ro,"* ]] && mode="ro" || mode="rw"
+    space_line="$(smb_manager::space_for_target "$target")"
+
+    if ((SHOW_ERRORS)); then
+      last_err="$(smb_manager::last_error_for_unit "${unit_base:-}" 24)"
+      last_err="${last_err:--}"
+    fi
+
+    if ((!FLAG_JSON)); then
+      if ((SHOW_ERRORS)); then
+        printf "%-36s %-18s %-18s %-7s %-7s %-4s %-18s %-30s\n" \
+          "$target" "$mstate/${unit_state}" "${unit_base:--}" \
+          "${vers:-?}" "${idle:--}" "$mode" "${space_line:--}" "$last_err" >&2
+      else
+        printf "%-36s %-18s %-18s %-7s %-7s %-4s %-18s\n" \
+          "$target" "$mstate/${unit_state}" "${unit_base:--}" \
+          "${vers:-?}" "${idle:--}" "$mode" "${space_line:--}" >&2
+      fi
+    fi
+
+    local last_field=""
+    if ((SHOW_ERRORS)); then
+      last_field=$(printf ',\"last_error\":\"%s\"' "$(smb_manager::json_escape "${last_err:-}")")
+    fi
+
+    local item
+    item="$(printf \
+      '{"target":"%s","source":"%s","fstype":"%s","state":"%s","unit":"%s","vers":"%s","idle_timeout":"%s","mode":"%s","space":"%s"%s}' \
+      "$(smb_manager::json_escape "$target")" "$(smb_manager::json_escape "$source")" \
+      "$(smb_manager::json_escape "$fstype")" "$(smb_manager::json_escape "$mstate/$unit_state")" \
+      "$(smb_manager::json_escape "${unit_base:-}")" "$(smb_manager::json_escape "${vers:-}")" \
+      "$(smb_manager::json_escape "${idle:-}")" "$(smb_manager::json_escape "$mode")" \
+      "$(smb_manager::json_escape "${space_line:-}")" "$last_field")"
+
+    out+="${sep}${item}"
+    sep=","
+  done
+  out+=']}'
+  smb_manager::jout "$out"
+}
+
+# ===== EXPORT / IMPORT (not yet implemented) =====
+smb_manager::export() {
+  msg_info "export is not yet implemented."
+  msg_info "When ready, it will serialize all CIFS fstab entries and credential paths to a portable JSON file."
+}
+smb_manager::import() {
+  msg_info "import is not yet implemented."
+  msg_info "When ready, it will restore mounts and credential files from an export JSON."
+}
+
+# ===== DISPATCHER =====
+smb_manager::run() {
+  case "$CMD" in
+  create)
+    smb_manager::acquire_write_lock
+    smb_manager::create "${GLOBAL_ARGS[@]:-}"
+    ;;
+  unmount)
+    smb_manager::acquire_write_lock
+    smb_manager::unmount "${GLOBAL_ARGS[@]:-}"
+    ;;
+  status)  smb_manager::status  "${GLOBAL_ARGS[@]:-}" ;;
+  verify)  smb_manager::verify  "${GLOBAL_ARGS[@]:-}" ;;
+  health)  smb_manager::health  "${GLOBAL_ARGS[@]:-}" ;;
+  export)  smb_manager::export  "${GLOBAL_ARGS[@]:-}" ;;
+  import)  smb_manager::import  "${GLOBAL_ARGS[@]:-}" ;;
+  help|"") smb_manager::usage ;;
+  *)
+    msg_err "Unknown command: $CMD"
+    smb_manager::usage >&2
+    exit 2
+    ;;
+  esac
+}
+
+# Environment check first — hard exits on WSL1 / unprivileged LXC
+smb_manager::check_environment
+
+if [[ -n "$CMD" ]]; then
+  smb_manager::run
+  exit $?
+fi
+
+# Interactive menu (no-arg curl invocation)
+while :; do
+  clear >/dev/null 2>&1 || true
+  smb_manager::list_cifs_mounts || true
+  printf '\n' >&2
+  printf "Choose an action:\n" >&2
+  printf "  1) Unmount / clean an existing SMB mount\n" >&2
+  printf "  2) Create a new persistent SMB mount\n" >&2
+  printf "  3) Status (enhanced)\n" >&2
+  printf "  4) Verify (self-tests)\n" >&2
+  printf "  5) Health (rw test)\n" >&2
+  printf "  0) Exit\n\n" >&2
+  printf "  (export / import not yet implemented)\n" >&2
+  case "$(tui_prompt "Select [0-5]")" in
+  1) smb_manager::unmount; read -rp $'\nPress Enter to continue... ' _ ;;
+  2) smb_manager::create;  read -rp $'\nPress Enter to continue... ' _ ;;
+  3) smb_manager::status;  read -rp $'\nPress Enter to continue... ' _ ;;
+  4) smb_manager::verify;  read -rp $'\nPress Enter to continue... ' _ ;;
+  5) smb_manager::health;  read -rp $'\nPress Enter to continue... ' _ ;;
+  0) msg_info "Bye."; exit 0 ;;
+  *) msg_warn "Unknown choice."; sleep 1 ;;
+  esac
+done

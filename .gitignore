@@ -1,0 +1,57 @@
+# =============================================================================
+# raaviutils — .gitignore
+# No secrets, no logs, no generated or temp files ever enter this repo.
+# =============================================================================
+
+# --- Credentials and secrets (permanent block) ---
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.csr
+*.der
+.env
+.env.*
+*.env
+.secrets
+*credentials*
+*credential*
+*secret*
+*token*
+*passwd*
+*password*
+*apikey*
+*api_key*
+id_rsa
+id_ed25519
+id_ecdsa
+*.gpg
+*.asc
+
+# --- raaviutils runtime data (stays local) ---
+logs/
+*.log
+shredder-audit.log
+
+# --- Editor and OS ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# --- Temp and backup ---
+*.tmp
+*.bak
+*.bak.*
+*.orig
+/etc/fstab.bak.*
+
+# --- Shell history (should never be here, but just in case) ---
+.bash_history
+.zsh_history
+.fish_history
