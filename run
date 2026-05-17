@@ -2,11 +2,11 @@
 # =============================================================================
 # tool:        run
 # category:    tools
-# description: Interactive TUI launcher for all raaviutils tools. Fetches and
-#              runs the selected tool on demand via curl.
-# usage:       run [--list]
-# depends:     curl, bash 4+
-# optional:    gum, fzf
+# description: Interactive full-screen TUI launcher for all raaviutils tools.
+#              Arrow keys to navigate, Enter to run, q to quit.
+# usage:       run [--list] [tool-name]
+# depends:     curl, bash 4+, tput
+# optional:    (none — pure bash TUI, no gum/fzf required)
 # curl:        curl -fsSL https://raw.githubusercontent.com/unrealthind/raaviutils/main/run | bash
 # =============================================================================
 set -euo pipefail
@@ -18,83 +18,405 @@ _LIB="${_BASE}/lib"
 source <(curl -fsSL "${_LIB}/colors.sh")
 # shellcheck source=/dev/null
 source <(curl -fsSL "${_LIB}/detect.sh")
-# shellcheck source=/dev/null
-source <(curl -fsSL "${_LIB}/tui.sh")
 
 need curl "install curl"
+need tput "install ncurses"
 
-# Hardcoded tool manifest (updated each phase)
-declare -A TOOL_DESC
-TOOL_DESC["string-generate"]="Generate cryptographically random strings, passphrases, or tokens"
-TOOL_DESC["smb-manager"]="Interactively list, mount, unmount, and browse SMB/CIFS shares"
+# =============================================================================
+# TOOL MANIFEST
+# =============================================================================
+# Format: TOOL_ORDER defines display order.
+# TOOL_CAT:  "tools" or "packages"
+# TOOL_DESC: one-line description
+# TOOL_LONG: multi-line detail shown in the preview pane
+
+declare -A TOOL_CAT TOOL_DESC TOOL_LONG
 
 TOOL_ORDER=(
   "string-generate"
   "smb-manager"
 )
 
-run::list() {
+TOOL_CAT["string-generate"]="tools"
+TOOL_DESC["string-generate"]="Generate cryptographically random strings, passphrases, or tokens"
+TOOL_LONG["string-generate"]="Generate cryptographically random output in
+three modes:
+
+  --hex [N]    N bytes of hex (default 32 → 64 chars)
+  --pass [N]   N-word passphrase (default 4 words)
+  --token      URL-safe base64 token (43 chars)
+
+Depends: openssl
+No side effects. Pure stdout."
+
+TOOL_CAT["smb-manager"]="tools"
+TOOL_DESC["smb-manager"]="Interactively list, mount, unmount, and browse SMB/CIFS shares"
+TOOL_LONG["smb-manager"]="Full SMB/CIFS mount manager. Commands:
+
+  create    Create a persistent mount with per-share
+            credentials and safe fstab edits
+  unmount   Unmount & clean (fstab, dir, creds)
+  status    Show current CIFS mounts (table or JSON)
+  verify    Preflight: DNS, port 445, smbclient probe
+  health    Check mounts: state, space, rw sanity test
+
+Depends: smbclient, mount.cifs, flock
+Requires sudo for mount/fstab operations."
+
+# =============================================================================
+# ANSI / TERMINAL HELPERS
+# =============================================================================
+_cursor_hide()    { printf '\033[?25l'; }
+_cursor_show()    { printf '\033[?25h'; }
+_clear_screen()   { printf '\033[2J\033[H'; }
+_move()           { printf '\033[%d;%dH' "$1" "$2"; }   # row col (1-based)
+_save_cursor()    { printf '\033[s'; }
+_restore_cursor() { printf '\033[u'; }
+
+# Box-drawing chars
+B_TL='┌' B_TR='┐' B_BL='└' B_BR='┘'
+B_H='─'  B_V='│'  B_TT='┬' B_BT='┴' B_LT='├' B_RT='┤' B_CR='┼'
+
+_hline() {
+  local n=$1
+  printf '%0.s'"$B_H" $(seq 1 "$n")
+}
+
+# Print a box. Args: row col width height [title]
+_box() {
+  local row=$1 col=$2 w=$3 h=$4 title="${5:-}"
+  local inner=$((w - 2))
+
+  _move "$row" "$col"
+  printf "${C_BLU}%s%s%s${C_NC}" "$B_TL" "$(_hline "$inner")" "$B_TR"
+
+  if [[ -n "$title" ]]; then
+    local tlen=${#title}
+    local tpad=$(( (inner - tlen - 2) / 2 ))
+    local tpad2=$(( inner - tlen - 2 - tpad ))
+    _move "$row" "$col"
+    printf "${C_BLU}%s%s ${C_CYN}%s${C_BLU} %s%s${C_NC}" \
+      "$B_TL" "$(_hline "$tpad")" "$title" "$(_hline "$tpad2")" "$B_TR"
+  fi
+
+  local r
+  for r in $(seq $((row + 1)) $((row + h - 2))); do
+    _move "$r" "$col"
+    printf "${C_BLU}%s${C_NC}%*s${C_BLU}%s${C_NC}" "$B_V" "$inner" "" "$B_V"
+  done
+
+  _move $((row + h - 1)) "$col"
+  printf "${C_BLU}%s%s%s${C_NC}" "$B_BL" "$(_hline "$inner")" "$B_BR"
+}
+
+# Print text clipped to width inside a box at (row, col+1), with optional color
+_cell() {
+  local row=$1 col=$2 width=$3 text=$4 color="${5:-}"
+  local clip
+  clip="${text:0:$width}"
+  local pad=$((width - ${#clip}))
+  _move "$row" "$col"
+  printf "%s%-${width}s%s" "$color" "$clip" "${color:+${C_NC}}"
+  printf "%${pad}s" "" 2>/dev/null || true
+}
+
+# =============================================================================
+# LAYOUT CONSTANTS (computed from terminal size)
+# =============================================================================
+_compute_layout() {
+  TERM_ROWS=$(tput lines)
+  TERM_COLS=$(tput cols)
+
+  # Minimum usable size
+  if ((TERM_ROWS < 16 || TERM_COLS < 60)); then
+    LAYOUT_TINY=1
+    return
+  fi
+  LAYOUT_TINY=0
+
+  # Outer box: full screen with 1-char margin
+  OUTER_ROW=1
+  OUTER_COL=1
+  OUTER_W=$TERM_COLS
+  OUTER_H=$TERM_ROWS
+
+  # Left panel (list): 36 chars wide or 40% of cols, whichever is smaller
+  LEFT_W=$(( TERM_COLS * 40 / 100 ))
+  ((LEFT_W < 30)) && LEFT_W=30
+  ((LEFT_W > 42)) && LEFT_W=42
+
+  # Right panel starts after left panel + divider
+  RIGHT_COL=$((OUTER_COL + LEFT_W))
+  RIGHT_W=$((OUTER_W - LEFT_W))
+
+  # Inner content areas (inside box borders)
+  LIST_ROW=$((OUTER_ROW + 2))       # +1 for box top, +1 for header
+  LIST_COL=$((OUTER_COL + 2))
+  LIST_W=$((LEFT_W - 3))
+  LIST_H=$((OUTER_H - 5))           # -2 box, -1 header, -1 footer, -1 padding
+
+  PREV_ROW=$((OUTER_ROW + 1))
+  PREV_COL=$((RIGHT_COL + 2))
+  PREV_W=$((RIGHT_W - 3))
+  PREV_H=$((OUTER_H - 4))
+
+  FOOTER_ROW=$((OUTER_ROW + OUTER_H - 1))
+}
+
+# =============================================================================
+# RENDER
+# =============================================================================
+_render_frame() {
+  _clear_screen
+
+  # Outer box with title
+  _box "$OUTER_ROW" "$OUTER_COL" "$OUTER_W" "$OUTER_H" "raaviutils"
+
+  # Vertical divider between list and preview
+  local r
+  for r in $(seq $((OUTER_ROW + 1)) $((OUTER_ROW + OUTER_H - 2))); do
+    _move "$r" "$RIGHT_COL"
+    printf "${C_BLU}%s${C_NC}" "$B_V"
+  done
+  # T-junctions where divider meets top/bottom
+  _move "$OUTER_ROW" "$RIGHT_COL"
+  printf "${C_BLU}%s${C_NC}" "$B_TT"
+  _move $((OUTER_ROW + OUTER_H - 1)) "$RIGHT_COL"
+  printf "${C_BLU}%s${C_NC}" "$B_BT"
+
+  # Header row inside left panel
+  _move $((OUTER_ROW + 1)) "$LIST_COL"
+  printf "${C_CYN}%-${LIST_W}s${C_NC}" "  Tool"
+
+  # Footer
+  _move "$FOOTER_ROW" $((OUTER_COL + 2))
+  printf "${C_BLU}[↑↓]${C_NC} navigate  ${C_BLU}[Enter]${C_NC} run  ${C_BLU}[q]${C_NC} quit"
+}
+
+_render_list() {
+  local selected=$1
+  local row=$LIST_ROW
+  local cat_shown_tools=0 cat_shown_pkgs=0
+  local visible_idx=0
+
   for tool in "${TOOL_ORDER[@]}"; do
-    printf "%-22s  %s\n" "$tool" "${TOOL_DESC[$tool]}"
+    local cat="${TOOL_CAT[$tool]}"
+    local desc="${TOOL_DESC[$tool]}"
+
+    # Category header
+    if [[ "$cat" == "tools" && $cat_shown_tools -eq 0 ]]; then
+      cat_shown_tools=1
+      _move "$row" "$LIST_COL"
+      printf "${C_YLW}%-${LIST_W}s${C_NC}" "TOOLS"
+      ((row++))
+      ((row > LIST_ROW + LIST_H)) && break
+    elif [[ "$cat" == "packages" && $cat_shown_pkgs -eq 0 ]]; then
+      cat_shown_pkgs=1
+      ((row++))
+      _move "$row" "$LIST_COL"
+      printf "${C_YLW}%-${LIST_W}s${C_NC}" "PACKAGES"
+      ((row++))
+      ((row > LIST_ROW + LIST_H)) && break
+    fi
+
+    local prefix="  "
+    local color=""
+    if ((visible_idx == selected)); then
+      prefix="▶ "
+      color="${C_GRN}"
+    fi
+
+    # Tool name line
+    _move "$row" "$LIST_COL"
+    printf "%s${color}%-$((LIST_W - 2))s${C_NC}" "$prefix" "$tool"
+    ((row++))
+    ((row > LIST_ROW + LIST_H)) && break
+
+    # Short description (truncated, indented)
+    local short="${desc:0:$((LIST_W - 4))}"
+    _move "$row" "$LIST_COL"
+    printf "    ${C_NC}\033[2m%-$((LIST_W - 4))s\033[0m" "$short"
+    ((row++))
+    ((row > LIST_ROW + LIST_H)) && break
+
+    ((visible_idx++))
   done
 }
 
-run::launch() {
+_render_preview() {
   local tool="$1"
-  msg_info "Fetching and running: $tool"
-  bash <(curl -fsSL "${_BASE}/tools/${tool}") "${@:2}"
+  local long="${TOOL_LONG[$tool]:-${TOOL_DESC[$tool]}}"
+  local curl_cmd="curl -fsSL ${_BASE}/tools/${tool} | bash"
+
+  # Tool name header
+  _move "$PREV_ROW" "$PREV_COL"
+  printf "${C_CYN}%-${PREV_W}s${C_NC}" "$tool"
+
+  _move $((PREV_ROW + 1)) "$PREV_COL"
+  printf "${C_BLU}%-${PREV_W}s${C_NC}" "$(_hline "$PREV_W")"
+
+  # Description lines
+  local row=$((PREV_ROW + 2))
+  while IFS= read -r line; do
+    ((row >= PREV_ROW + PREV_H - 3)) && break
+    _move "$row" "$PREV_COL"
+    printf "%-${PREV_W}s" "${line:0:$PREV_W}"
+    ((row++))
+  done <<<"$long"
+
+  # Curl command at bottom of preview
+  local curl_row=$((OUTER_ROW + OUTER_H - 3))
+  _move "$curl_row" "$PREV_COL"
+  printf "${C_BLU}%-${PREV_W}s${C_NC}" "curl:"
+  _move $((curl_row + 1)) "$PREV_COL"
+  local clip="${curl_cmd:0:$PREV_W}"
+  printf "\033[2m%-${PREV_W}s\033[0m" "$clip"
 }
 
-# --- argument parsing ---
+# =============================================================================
+# INPUT
+# =============================================================================
+_read_key() {
+  local key
+  IFS= read -rsn1 key
+  if [[ "$key" == $'\x1b' ]]; then
+    local seq1 seq2
+    IFS= read -rsn1 -t 0.1 seq1 || true
+    IFS= read -rsn1 -t 0.1 seq2 || true
+    key="${key}${seq1}${seq2}"
+  fi
+  printf '%s' "$key"
+}
+
+# =============================================================================
+# FALLBACK (tiny terminal or non-TTY)
+# =============================================================================
+_run_fallback() {
+  msg_info "raaviutils — available tools"
+  local i=1
+  for tool in "${TOOL_ORDER[@]}"; do
+    printf "  %2d) %-22s  %s\n" "$i" "$tool" "${TOOL_DESC[$tool]}"
+    ((i++))
+  done
+  printf '\n'
+  local choice
+  read -rp "Run tool [1-$((i-1))] or 0 to cancel: " choice
+  if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice < i)); then
+    local tool="${TOOL_ORDER[$((choice - 1))]}"
+    msg_info "Fetching and running: $tool"
+    bash <(curl -fsSL "${_BASE}/tools/${tool}")
+  else
+    msg_info "Canceled."
+  fi
+}
+
+# =============================================================================
+# MAIN TUI LOOP
+# =============================================================================
+_tui_main() {
+  local n_tools=${#TOOL_ORDER[@]}
+  local selected=0
+
+  _cursor_hide
+  trap '_cursor_show; tput rmcup 2>/dev/null || true; tput cnorm 2>/dev/null || true' EXIT INT TERM
+
+  # Use alternate screen buffer
+  tput smcup 2>/dev/null || true
+
+  _compute_layout
+  _render_frame
+  _render_list "$selected"
+  _render_preview "${TOOL_ORDER[$selected]}"
+
+  # Handle terminal resize
+  trap '_compute_layout; _render_frame; _render_list "$selected"; _render_preview "${TOOL_ORDER[$selected]}"' WINCH
+
+  while true; do
+    local key
+    key=$(_read_key)
+
+    case "$key" in
+    $'\x1b[A'|k)   # Up
+      ((selected > 0)) && ((selected--))
+      _render_list "$selected"
+      _render_preview "${TOOL_ORDER[$selected]}"
+      ;;
+    $'\x1b[B'|j)   # Down
+      ((selected < n_tools - 1)) && ((selected++))
+      _render_list "$selected"
+      _render_preview "${TOOL_ORDER[$selected]}"
+      ;;
+    $'\n'|$'\r'|' ')  # Enter / Space — run
+      local tool="${TOOL_ORDER[$selected]}"
+      tput rmcup 2>/dev/null || true
+      _cursor_show
+      trap - EXIT INT TERM WINCH
+      msg_info "Fetching and running: $tool"
+      bash <(curl -fsSL "${_BASE}/tools/${tool}")
+      exit $?
+      ;;
+    q|Q|$'\x1b')   # Quit
+      exit 0
+      ;;
+    esac
+  done
+}
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+# --list flag: print tool manifest and exit
 if [[ "${1:-}" == "--list" || "${1:-}" == "-l" ]]; then
-  run::list
+  for tool in "${TOOL_ORDER[@]}"; do
+    printf "%-22s  %s\n" "$tool" "${TOOL_DESC[$tool]}"
+  done
   exit 0
 fi
 
+# --help flag
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'USAGE'
-Usage: run [--list]
+Usage: run [--list] [tool-name]
 
-  No args     Launch the interactive tool picker
-  --list      Print available tools and exit
+  No args       Launch the interactive TUI
+  --list        Print available tools and exit
+  tool-name     Run a specific tool directly
 
+Navigation:
+  ↑ / ↓ or k/j  Move selection
+  Enter / Space  Run selected tool
+  q / Esc        Quit
 USAGE
   exit 0
 fi
 
-# If a tool name was passed directly, run it
+# Direct tool name argument
 if [[ $# -gt 0 ]]; then
   tool="$1"
   shift
-  if [[ -v "TOOL_DESC[$tool]" ]]; then
-    run::launch "$tool" "$@"
+  if [[ -v "TOOL_CAT[$tool]" ]]; then
+    msg_info "Fetching and running: $tool"
+    bash <(curl -fsSL "${_BASE}/tools/${tool}") "$@"
     exit $?
   else
     msg_err "Unknown tool: $tool"
-    msg_info "Available tools:"
-    run::list >&2
+    msg_info "Run with --list to see available tools."
     exit 2
   fi
 fi
 
-# --- interactive picker ---
-msg_info "raaviutils — pick a tool to run"
-printf '\n' >&2
-
-menu_items=()
-for tool in "${TOOL_ORDER[@]}"; do
-  menu_items+=("$(printf '%-22s  %s' "$tool" "${TOOL_DESC[$tool]}")")
-done
-
-picked=$(tui_pick "Select a tool (ESC to cancel)" "${menu_items[@]}")
-
-if [[ -z "$picked" ]]; then
-  msg_info "Canceled."
-  exit 0
+# Non-interactive or tiny terminal: fall back to plain menu
+if [[ ! -t 0 || ! -t 1 ]]; then
+  _run_fallback
+  exit $?
 fi
 
-# Extract tool name from the picked line (first word)
-selected_tool="${picked%%  *}"
-selected_tool="${selected_tool%% *}"
+_compute_layout
+if ((LAYOUT_TINY)); then
+  msg_warn "Terminal too small (need 60×16 minimum). Using plain menu."
+  _run_fallback
+  exit $?
+fi
 
-run::launch "$selected_tool"
+_tui_main
